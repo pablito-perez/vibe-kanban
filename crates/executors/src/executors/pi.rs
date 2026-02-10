@@ -20,8 +20,8 @@ pub mod normalize_logs;
 
 use normalize_logs::normalize_logs;
 
-const PI_NPM_PACKAGE: &str = "@mariozechner/pi-coding-agent";
-const PI_NPM_PACKAGE_VERSION: &str = "0.52.9";
+const PI_NPM_PACKAGE: &str = "@pablito-perez/pi-coding-agent";
+const PI_NPM_PACKAGE_VERSION: &str = "0.52.12";
 
 async fn write_rpc_message(
     stdin: &mut tokio::process::ChildStdin,

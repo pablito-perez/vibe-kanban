@@ -42,16 +42,24 @@ fi
 echo "🔍 Detected platform: $PLATFORM"
 echo "🔧 Using target directory: $CARGO_TARGET_DIR"
 
-# Set API base URL for remote features
-export VK_SHARED_API_BASE="https://api.vibekanban.com"
-export VITE_VK_SHARED_API_BASE="https://api.vibekanban.com"
+# # Set API base URL for remote features
+# export VK_SHARED_API_BASE="https://api.vibekanban.com"
+# export VITE_VK_SHARED_API_BASE="https://api.vibekanban.com"
 
 echo "🧹 Cleaning previous builds..."
 rm -rf npx-cli/dist
 mkdir -p npx-cli/dist/$PLATFORM
 
 echo "🔨 Building frontend..."
-(cd frontend && npm run build)
+FRONTEND_NODE_OPTIONS="${NODE_OPTIONS:-}"
+if [[ "$FRONTEND_NODE_OPTIONS" != *"--max-old-space-size="* ]]; then
+  if [ -n "$FRONTEND_NODE_OPTIONS" ]; then
+    FRONTEND_NODE_OPTIONS="${FRONTEND_NODE_OPTIONS} --max-old-space-size=4096"
+  else
+    FRONTEND_NODE_OPTIONS="--max-old-space-size=4096"
+  fi
+fi
+(cd frontend && NODE_OPTIONS="$FRONTEND_NODE_OPTIONS" npm run build)
 
 echo "🔨 Building Rust binaries..."
 cargo build --release --manifest-path Cargo.toml
