@@ -155,6 +155,12 @@ pub async fn follow_up(
 
     let latest_session_info = CodingAgentTurn::find_latest_session_info(pool, session.id).await?;
 
+    tracing::info!(
+        "Follow-up for session {}: latest_session_info = {:?}",
+        session.id,
+        latest_session_info.as_ref().map(|info| &info.session_id)
+    );
+
     let prompt = payload.prompt;
 
     let repos = WorkspaceRepo::find_repos_for_workspace(pool, workspace.id).await?;
@@ -168,6 +174,7 @@ pub async fn follow_up(
 
     let action_type = if let Some(info) = latest_session_info {
         let is_reset = payload.retry_process_id.is_some();
+        tracing::info!("Using follow-up with session_id: {}", info.session_id);
         ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
             prompt: prompt.clone(),
             session_id: info.session_id,
@@ -176,6 +183,7 @@ pub async fn follow_up(
             working_dir: working_dir.clone(),
         })
     } else {
+        tracing::warn!("No session info found, falling back to initial request (context will be lost)");
         ExecutorActionType::CodingAgentInitialRequest(
             executors::actions::coding_agent_initial::CodingAgentInitialRequest {
                 prompt,

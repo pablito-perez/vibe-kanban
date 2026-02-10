@@ -38,6 +38,11 @@ impl CommandParts {
             .ok_or(ExecutorError::ExecutableNotFound { program })?;
         Ok((executable, args))
     }
+
+    #[cfg(test)]
+    pub(crate) fn into_parts(self) -> (String, Vec<String>) {
+        (self.program, self.args)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, JsonSchema, Default)]

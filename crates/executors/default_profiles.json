@@ -327,6 +327,29 @@
           "model": "glm-4.6"
         }
       }
+    },
+    "PI": {
+      "DEFAULT": {
+        "PI": {}
+      },
+      "OPUS": {
+        "PI": {
+          "provider": "anthropic",
+          "model": "claude-opus-4-6"
+        }
+      },
+      "CODEX": {
+        "PI": {
+          "provider": "openai",
+          "model": "gpt-5.2-codex"
+        }
+      },
+      "DEVSTRAL": {
+        "PI": {
+          "provider": "mistral",
+          "model": "devstral-2512"
+        }
+      }
     }
   }
 }

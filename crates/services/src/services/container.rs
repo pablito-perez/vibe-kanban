@@ -1030,11 +1030,20 @@ pub trait ContainerService {
             };
 
             if let Some(store) = store {
+                tracing::info!("Starting raw logs consumer for execution_id: {}", execution_id);
                 let mut stream = store.history_plus_stream();
 
+                let mut finished_received = false;
+
                 while let Some(Ok(msg)) = stream.next().await {
+                    tracing::trace!("Consumer received message for execution {}: {:?}", execution_id, msg.name());
                     match &msg {
                         LogMsg::Stdout(_) | LogMsg::Stderr(_) => {
+                            // Skip stdout/stderr after Finished to avoid processing stale logs
+                            if finished_received {
+                                continue;
+                            }
+
                             // Serialize this individual message as a JSONL line
                             match serde_json::to_string(&msg) {
                                 Ok(jsonl_line) => {
@@ -1065,23 +1074,48 @@ pub trait ContainerService {
                             }
                         }
                         LogMsg::SessionId(agent_session_id) => {
-                            // Append this line to the database
-                            if let Err(e) = CodingAgentTurn::update_agent_session_id(
+                            // Process SessionId even after Finished - critical for session continuity
+                            tracing::info!(
+                                "Received SessionId message: {} for execution_id: {} (after_finished: {})",
+                                agent_session_id,
+                                execution_id,
+                                finished_received
+                            );
+                            match CodingAgentTurn::update_agent_session_id(
                                 &db.pool,
                                 execution_id,
                                 agent_session_id,
                             )
                             .await
                             {
-                                tracing::error!(
-                                    "Failed to update agent_session_id {} for execution process {}: {}",
-                                    agent_session_id,
-                                    execution_id,
-                                    e
+                                Ok(_) => {
+                                    tracing::info!(
+                                        "Successfully updated agent_session_id {} for execution process {}",
+                                        agent_session_id,
+                                        execution_id
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to update agent_session_id {} for execution process {}: {}",
+                                        agent_session_id,
+                                        execution_id,
+                                        e
+                                    );
+                                }
+                            }
+
+                            // If we got SessionId after Finished, we can safely exit now
+                            if finished_received {
+                                tracing::info!(
+                                    "SessionId processed after Finished, exiting consumer loop for execution {}",
+                                    execution_id
                                 );
+                                break;
                             }
                         }
                         LogMsg::MessageId(agent_message_id) => {
+                            // Process MessageId even after Finished - may be needed for resets
                             if let Err(e) = CodingAgentTurn::update_agent_message_id(
                                 &db.pool,
                                 execution_id,
@@ -1096,13 +1130,25 @@ pub trait ContainerService {
                                     e
                                 );
                             }
+
+                            // If we got MessageId after Finished, exit
+                            if finished_received {
+                                break;
+                            }
                         }
                         LogMsg::Finished => {
-                            break;
+                            tracing::info!(
+                                "Received Finished message for execution {}, will drain remaining critical messages",
+                                execution_id
+                            );
+                            finished_received = true;
+                            // Don't break yet - continue to drain SessionId/MessageId messages
                         }
                         LogMsg::JsonPatch(_) | LogMsg::Ready => continue,
                     }
                 }
+            } else {
+                tracing::error!("No message store found for execution_id: {}", execution_id);
             }
         })
     }
@@ -1385,6 +1431,7 @@ pub trait ContainerService {
             }
         }
 
+        tracing::info!("About to spawn raw logs consumer for execution_id: {}", execution_process.id);
         let db_stream_handle = self.spawn_stream_raw_logs_to_db(&execution_process.id);
         self.store_db_stream_handle(execution_process.id, db_stream_handle)
             .await;

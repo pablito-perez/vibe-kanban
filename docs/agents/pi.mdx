@@ -1,0 +1,44 @@
+---
+title: "Pi"
+description: "Set up Pi coding agent"
+icon: https://www.vibekanban.com/images/logos/pi-logo.svg
+---
+
+<Steps>
+<Step title="Install Pi">
+  ```bash
+  npm install -g @mariozechner/pi-coding-agent@0.52.9
+  ```
+
+  For the latest installation instructions, visit the [Pi documentation](https://github.com/badlogic/pi-mono).
+</Step>
+
+<Step title="Authenticate">
+  Pi supports multiple providers. You can authenticate with an API key:
+
+  ```bash
+  export ANTHROPIC_API_KEY=sk-ant-...
+  ```
+
+  Or use an existing subscription by running `pi` and using the `/login` command to select your provider.
+</Step>
+
+<Step title="Start Vibe Kanban">
+  Once authenticated, launch Vibe Kanban:
+
+  ```bash
+  npx vibe-kanban
+  ```
+
+  You can now select Pi when creating task attempts.
+</Step>
+
+<Step title="Update the pinned version">
+  We pin the Pi npm version to a tested release. To update it:
+
+  1. Run `npm view @mariozechner/pi-coding-agent version` to confirm the latest release.
+  2. Update `crates/executors/src/executors/pi.rs` (`PI_NPM_PACKAGE_VERSION`).
+  3. Update this doc to match the new version.
+  4. Verify profiles still resolve (Pi appears in the executor profile list and launches successfully).
+</Step>
+</Steps>

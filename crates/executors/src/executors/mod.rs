@@ -22,7 +22,7 @@ use crate::{
     env::ExecutionEnv,
     executors::{
         amp::Amp, claude::ClaudeCode, codex::Codex, copilot::Copilot, cursor::CursorAgent,
-        droid::Droid, gemini::Gemini, opencode::Opencode, qwen::QwenCode,
+        droid::Droid, gemini::Gemini, opencode::Opencode, pi::Pi, qwen::QwenCode,
     },
     logs::utils::patch,
     mcp_config::McpConfig,
@@ -37,6 +37,7 @@ pub mod cursor;
 pub mod droid;
 pub mod gemini;
 pub mod opencode;
+pub mod pi;
 #[cfg(feature = "qa-mode")]
 pub mod qa_mock;
 pub mod qwen;
@@ -117,6 +118,7 @@ pub enum CodingAgent {
     QwenCode,
     Copilot,
     Droid,
+    Pi,
     #[cfg(feature = "qa-mode")]
     QaMock(QaMockExecutor),
 }
@@ -187,7 +189,7 @@ impl CodingAgent {
                 BaseAgentCapability::SetupHelper,
                 BaseAgentCapability::ContextUsage,
             ],
-            Self::Amp(_) | Self::Gemini(_) | Self::QwenCode(_) => {
+            Self::Amp(_) | Self::Gemini(_) | Self::QwenCode(_) | Self::Pi(_) => {
                 vec![BaseAgentCapability::SessionFork]
             }
             Self::CursorAgent(_) => vec![BaseAgentCapability::SetupHelper],
