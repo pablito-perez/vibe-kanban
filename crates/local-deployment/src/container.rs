@@ -474,20 +474,7 @@ impl LocalContainerService {
                 tracing::error!("Failed to update execution process completion: {}", e);
             }
 
-            let mut should_delay_for_session = false;
-
             if let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await {
-                should_delay_for_session = matches!(
-                    ctx.execution_process.run_reason,
-                    ExecutionProcessRunReason::CodingAgent
-                ) && matches!(
-                    ctx.execution_process
-                        .executor_action()
-                        .ok()
-                        .and_then(|action| action.base_executor()),
-                    Some(BaseCodingAgent::Pi)
-                );
-
                 // Update executor session summary if available
                 if let Err(e) = container.update_executor_session_summary(&exec_id).await {
                     tracing::warn!("Failed to update executor session summary: {}", e);
@@ -664,23 +651,6 @@ impl LocalContainerService {
                     "Execution {} completed, pushing Finished message to consumer",
                     exec_id
                 );
-
-                if should_delay_for_session {
-                    // Pi discovers its session_id asynchronously via log normalization.
-                    // Instead of a fixed sleep, wait for the session_id to appear (up to 6s).
-                    let session_id = msg_arc.wait_for_session_id(Duration::from_secs(6)).await;
-                    if session_id.is_some() {
-                        tracing::info!(
-                            "Observed Pi session_id before Finished for execution {}",
-                            exec_id
-                        );
-                    } else {
-                        tracing::info!(
-                            "Timed out waiting for Pi session_id; pushing Finished for execution {}",
-                            exec_id
-                        );
-                    }
-                }
                 msg_arc.push_finished();
             }
             if let Some(handle) = db_stream_handle {

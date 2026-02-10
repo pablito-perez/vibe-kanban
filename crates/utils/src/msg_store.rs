@@ -101,43 +101,6 @@ impl MsgStore {
             .collect()
     }
 
-    fn session_id_from_history(&self) -> Option<String> {
-        self.get_history().iter().find_map(|msg| match msg {
-            LogMsg::SessionId(id) => Some(id.clone()),
-            _ => None,
-        })
-    }
-
-    /// Wait for a session_id to appear in the log stream, returning it if observed.
-    /// This is a best-effort helper for executors (like Pi) that discover the session
-    /// asynchronously during or after execution. Callers should still apply a timeout.
-    pub async fn wait_for_session_id(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Option<String> {
-        if let Some(id) = self.session_id_from_history() {
-            return Some(id);
-        }
-
-        let mut rx = self.get_receiver();
-        let waiter = async {
-            loop {
-                match rx.recv().await {
-                    Ok(LogMsg::SessionId(id)) => return Some(id),
-                    Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Some(id) = self.session_id_from_history() {
-                            return Some(id);
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
-            }
-        };
-
-        tokio::time::timeout(timeout, waiter).await.ok().flatten()
-    }
-
     /// History then live, as `LogMsg`.
     pub fn history_plus_stream(
         &self,
