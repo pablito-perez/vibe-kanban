@@ -2,37 +2,24 @@ use std::{path::Path, process::Stdio, sync::Arc};
 
 use async_trait::async_trait;
 use command_group::AsyncCommandGroup;
-use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tokio::{
-    io::AsyncWriteExt,
-    process::Command,
-    sync::watch,
-    time::{Duration, sleep},
-};
+use tokio::{io::AsyncWriteExt, process::Command};
 use ts_rs::TS;
-use workspace_utils::{msg_store::MsgStore, stream_lines::LinesStreamExt};
+use uuid::Uuid;
+use workspace_utils::msg_store::MsgStore;
 
 use crate::{
     command::{CommandBuildError, CommandBuilder, CommandParts},
     env::ExecutionEnv,
     executors::{AppendPrompt, ExecutorError, SpawnedChild, StandardCodingAgentExecutor},
     logs::utils::EntryIndexProvider,
-    stdout_dup::duplicate_stdout,
 };
 
 pub mod normalize_logs;
-pub mod session;
 
-use normalize_logs::{extract_session_id_from_state, normalize_logs};
+use normalize_logs::normalize_logs;
 
-use self::session::fork_session;
-
-// Keep the retry cadence aligned with Pi's filesystem discovery (~5.4s total)
-// so we don't add extra latency if RPC `get_state` is slow.
-const GET_STATE_RETRY_DELAYS_MS: [u64; 6] = [0, 300, 600, 1000, 1500, 2000];
 const PI_NPM_PACKAGE: &str = "@mariozechner/pi-coding-agent";
 const PI_NPM_PACKAGE_VERSION: &str = "0.52.9";
 
@@ -45,24 +32,6 @@ async fn write_rpc_message(
     stdin.write_all(b"\n").await?;
     stdin.flush().await?;
     Ok(())
-}
-
-fn try_extract_session_id_from_get_state_line(line: &str) -> Option<String> {
-    // We parse the raw stdout line as JSON to find `get_state` responses.
-    // This is intentionally local to Pi to avoid modifying the global executor pipeline.
-    let value: Value = serde_json::from_str(line).ok()?;
-    if value.get("type")?.as_str()? != "response" {
-        return None;
-    }
-    if value.get("command")?.as_str()? != "get_state" {
-        return None;
-    }
-    if !value.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return None;
-    }
-
-    let data = value.get("data").cloned();
-    extract_session_id_from_state(&data)
 }
 
 /// Pi executor configuration
@@ -148,26 +117,7 @@ async fn spawn_pi(
         .apply_to_command(&mut command);
 
     let mut child = command.group_spawn()?;
-
-    // Duplicate stdout so we can observe `get_state` responses without
-    // stealing the stream from the container log pipeline.
-    // Trade-off: if we cannot duplicate stdout, we fail spawn rather than
-    // proceeding with ambiguous logging behavior.
-    let stdout_dup = duplicate_stdout(&mut child)?;
-    let mut stdout_lines = stdout_dup.lines();
-
-    // Shared signal to stop stdin polling once we observe a session_id.
-    let (session_ready_tx, mut session_ready_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        while let Some(Ok(line)) = stdout_lines.next().await {
-            if try_extract_session_id_from_get_state_line(&line).is_some() {
-                let _ = session_ready_tx.send(true);
-                break;
-            }
-        }
-    });
-
-    // Send RPC prompt message via stdin, then poll get_state until ready.
+    // Send the RPC prompt and close stdin.
     if let Some(mut stdin) = child.inner().stdin.take() {
         let rpc_message = serde_json::json!({
             "type": "prompt",
@@ -175,34 +125,7 @@ async fn spawn_pi(
         });
 
         write_rpc_message(&mut stdin, &rpc_message).await?;
-
-        tokio::spawn(async move {
-            for delay_ms in GET_STATE_RETRY_DELAYS_MS {
-                if delay_ms > 0 {
-                    tokio::select! {
-                        _ = sleep(Duration::from_millis(delay_ms)) => {},
-                        _ = session_ready_rx.changed() => {},
-                    }
-                }
-
-                if *session_ready_rx.borrow() {
-                    break;
-                }
-
-                let get_state_message = serde_json::json!({
-                    "type": "get_state"
-                });
-
-                if let Err(err) = write_rpc_message(&mut stdin, &get_state_message).await {
-                    tracing::debug!("Failed to send Pi get_state command: {}", err);
-                    break;
-                }
-            }
-
-            // Close stdin once we either observe a session_id or exhaust retries.
-            // This avoids a long-lived stdin pipe while still allowing an early stop.
-            let _ = stdin.shutdown().await;
-        });
+        stdin.shutdown().await?;
     }
 
     Ok(child.into())
@@ -216,7 +139,14 @@ impl StandardCodingAgentExecutor for Pi {
         prompt: &str,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
-        let pi_command = self.build_command_builder()?.build_initial()?;
+        // Generate a session_id upfront so that:
+        // 1. Pi uses it immediately (no async discovery needed)
+        // 2. normalize_logs picks it up from the agent_start event
+        // 3. Follow-ups can reference it without race conditions
+        let session_id = Uuid::new_v4().to_string();
+        let pi_command = self
+            .build_command_builder()?
+            .build_follow_up(&["--session-id".to_string(), session_id])?;
         let combined_prompt = self.append_prompt.combine_prompt(prompt);
 
         spawn_pi(pi_command, &combined_prompt, current_dir, env, &self.cmd).await
@@ -230,17 +160,9 @@ impl StandardCodingAgentExecutor for Pi {
         _reset_to_message_id: Option<&str>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
-        // Fork the session first (if Pi supports session forking)
-        let forked_session_path = fork_session(session_id).map_err(|e| {
-            ExecutorError::FollowUpNotSupported(format!(
-                "Failed to fork Pi session {session_id}: {e}"
-            ))
-        })?;
-
-        let session_path_str = forked_session_path.to_string_lossy().to_string();
         let continue_cmd = self
             .build_command_builder()?
-            .build_follow_up(&["--session".to_string(), session_path_str])?;
+            .build_follow_up(&["--session-id".to_string(), session_id.to_string()])?;
         let combined_prompt = self.append_prompt.combine_prompt(prompt);
 
         spawn_pi(continue_cmd, &combined_prompt, current_dir, env, &self.cmd).await
@@ -255,9 +177,10 @@ impl StandardCodingAgentExecutor for Pi {
     }
 
     fn default_mcp_config_path(&self) -> Option<std::path::PathBuf> {
-        // Pi uses extensions, not MCP servers
-        // We check for Pi's config directory to determine if it's installed
-        dirs::home_dir().map(|home| home.join(".pi").join("agent").join("config.toml"))
+        // Pi uses its own extension system rather than MCP servers,
+        // so we return None to signal that MCP is not supported.
+        // Availability is handled separately in `get_availability_info`.
+        None
     }
 
     fn get_availability_info(&self) -> crate::executors::AvailabilityInfo {
@@ -280,9 +203,8 @@ impl StandardCodingAgentExecutor for Pi {
 
 #[cfg(test)]
 mod tests {
-    use crate::command::CmdOverrides;
-
     use super::*;
+    use crate::command::CmdOverrides;
 
     #[test]
     fn pi_follow_up_args_extend_initial() {
@@ -297,12 +219,12 @@ mod tests {
         let builder = pi.build_command_builder().unwrap();
         let (initial_program, initial_args) = builder.build_initial().unwrap().into_parts();
         let (follow_up_program, follow_up_args) = builder
-            .build_follow_up(&["--session".to_string(), "session-path".to_string()])
+            .build_follow_up(&["--session-id".to_string(), "session-id".to_string()])
             .unwrap()
             .into_parts();
 
         assert_eq!(initial_program, follow_up_program);
         assert!(follow_up_args.starts_with(&initial_args));
-        assert!(follow_up_args.ends_with(&["--session".to_string(), "session-path".to_string()]));
+        assert!(follow_up_args.ends_with(&["--session-id".to_string(), "session-id".to_string()]));
     }
 }

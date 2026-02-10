@@ -1,12 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::SystemTime,
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use futures::{StreamExt, future::ready};
 use serde::{Deserialize, Serialize};
@@ -31,14 +23,13 @@ pub fn normalize_logs(
     normalize_stderr_logs(msg_store.clone(), entry_index_provider.clone());
 
     let worktree_path = worktree_path.to_path_buf();
-    // Record the process start time to filter out session files from concurrent runs
-    let process_start_time = SystemTime::now();
 
     tokio::spawn(async move {
-        let session_id_pushed = Arc::new(AtomicBool::new(false));
-        let session_discovery_in_flight = Arc::new(AtomicBool::new(false));
+        let mut session_id_pushed = false;
         let mut tool_states: HashMap<String, ToolState> = HashMap::new();
         let mut current_message_content = String::new();
+        let mut current_thinking_content = String::new();
+        let mut thinking_entry_index: Option<usize> = None;
 
         let worktree_path_str = worktree_path.to_string_lossy();
 
@@ -69,50 +60,78 @@ pub fn normalize_logs(
 
             // Handle different Pi event types
             match pi_event {
-                PiEvent::AgentStart { session_id, model } => {
+                PiEvent::AgentStart { session_id } => {
                     tracing::debug!("Pi AgentStart event received: session_id={:?}", session_id);
 
-                    if !session_id_pushed.load(Ordering::Relaxed) {
-                        if let Some(sid) = session_id {
-                            push_session_id_once(&msg_store, &session_id_pushed, sid);
-                        } else {
-                            spawn_session_discovery(
-                                msg_store.clone(),
-                                worktree_path.clone(),
-                                session_id_pushed.clone(),
-                                session_discovery_in_flight.clone(),
-                                process_start_time,
-                            );
-                        }
-                    }
-
-                    if let Some(model_name) = model {
-                        let entry = NormalizedEntry {
-                            timestamp: None,
-                            entry_type: NormalizedEntryType::SystemMessage,
-                            content: format!("model: {}", model_name),
-                            metadata: None,
-                        };
-                        add_normalized_entry(&msg_store, &entry_index_provider, entry);
+                    if !session_id_pushed && let Some(sid) = session_id {
+                        msg_store.push_session_id(sid);
+                        session_id_pushed = true;
                     }
                 }
 
                 PiEvent::MessageUpdate {
+                    message: _,
                     assistant_message_event,
                 } => {
-                    // Accumulate message content from deltas
                     match assistant_message_event {
+                        // --- Thinking events ---
+                        AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                            current_thinking_content.push_str(&delta);
+
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::Thinking,
+                                content: current_thinking_content.clone(),
+                                metadata: None,
+                            };
+
+                            if let Some(idx) = thinking_entry_index {
+                                replace_normalized_entry(&msg_store, idx, entry);
+                            } else {
+                                let idx = add_normalized_entry(
+                                    &msg_store,
+                                    &entry_index_provider,
+                                    entry,
+                                );
+                                thinking_entry_index = Some(idx);
+                            }
+                        }
+                        AssistantMessageEvent::ThinkingEnd { content, .. } => {
+                            if !content.is_empty() {
+                                current_thinking_content = content;
+                            }
+
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::Thinking,
+                                content: current_thinking_content.clone(),
+                                metadata: None,
+                            };
+
+                            if let Some(idx) = thinking_entry_index {
+                                replace_normalized_entry(&msg_store, idx, entry);
+                            } else {
+                                add_normalized_entry(&msg_store, &entry_index_provider, entry);
+                            }
+
+                            // Reset for potential next thinking block
+                            current_thinking_content.clear();
+                            thinking_entry_index = None;
+                        }
+
+                        // --- Text events ---
                         AssistantMessageEvent::TextDelta { delta, .. } => {
                             current_message_content.push_str(&delta);
                         }
                         AssistantMessageEvent::TextEnd { content, .. } => {
-                            // Use the final content if available
                             if !content.is_empty() {
                                 current_message_content = content;
                             }
                         }
+
                         _ => {
-                            // Ignore thinking, toolcall events for now
+                            // ThinkingStart, TextStart, Toolcall* events are
+                            // structural markers and don't carry content we need.
                         }
                     }
                 }
@@ -156,7 +175,11 @@ pub fn normalize_logs(
                         update_tool_state_with_output(&mut state, result);
 
                         if let Some(index) = state.index {
-                            replace_normalized_entry(&msg_store, index, state.to_normalized_entry());
+                            replace_normalized_entry(
+                                &msg_store,
+                                index,
+                                state.to_normalized_entry(),
+                            );
                         }
                     }
                 }
@@ -190,24 +213,60 @@ pub fn normalize_logs(
                 PiEvent::Response {
                     command,
                     success,
-                    data,
+                    error,
                     ..
                 } => {
-                    if command == "get_state" && success {
-                        if let Some(session_id) = extract_session_id_from_state(&data) {
-                            push_session_id_once(
-                                &msg_store,
-                                &session_id_pushed,
-                                session_id.to_string(),
-                            );
-                        }
+                    // RPC responses confirm receipt of commands (e.g. the initial prompt).
+                    // Surface failures as error messages so they're visible to the user.
+                    if !success {
+                        let msg = error.unwrap_or_else(|| {
+                            format!("RPC command '{}' failed (no details)", command)
+                        });
+                        let entry = NormalizedEntry {
+                            timestamp: None,
+                            entry_type: NormalizedEntryType::ErrorMessage {
+                                error_type: NormalizedEntryError::Other,
+                            },
+                            content: msg,
+                            metadata: None,
+                        };
+                        add_normalized_entry(&msg_store, &entry_index_provider, entry);
                     }
                 }
 
                 _ => {
-                    // Other events we don't handle (MessageStart, MessageEnd, TurnStart, etc.)
+                    // Forward-compatible: MessageStart, MessageEnd, TurnStart,
+                    // ToolExecutionUpdate, and any future event types are
+                    // silently ignored.
                 }
             }
+        }
+
+        // Flush any remaining content when the stream ends.
+        // This covers cases where the process exits or crashes before
+        // emitting a TurnEnd/AgentEnd event.
+        if !current_thinking_content.is_empty() {
+            let entry = NormalizedEntry {
+                timestamp: None,
+                entry_type: NormalizedEntryType::Thinking,
+                content: current_thinking_content,
+                metadata: None,
+            };
+            if let Some(idx) = thinking_entry_index {
+                replace_normalized_entry(&msg_store, idx, entry);
+            } else {
+                add_normalized_entry(&msg_store, &entry_index_provider, entry);
+            }
+        }
+
+        if !current_message_content.is_empty() {
+            let entry = NormalizedEntry {
+                timestamp: None,
+                entry_type: NormalizedEntryType::AssistantMessage,
+                content: current_message_content,
+                metadata: None,
+            };
+            add_normalized_entry(&msg_store, &entry_index_provider, entry);
         }
     });
 }
@@ -239,149 +298,6 @@ fn normalize_stderr_logs(msg_store: Arc<MsgStore>, entry_index_provider: EntryIn
                 msg_store.push_patch(patch);
             }
         }
-    });
-}
-
-fn push_session_id_once(
-    msg_store: &Arc<MsgStore>,
-    session_id_pushed: &Arc<AtomicBool>,
-    session_id: String,
-) -> bool {
-    if session_id_pushed.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-
-    tracing::info!("Pushing session_id to MsgStore: {}", session_id);
-    msg_store.push_session_id(session_id);
-    tracing::info!("Session ID queued for database persistence");
-    true
-}
-
-/// Extract session_id from a Pi `get_state` response payload.
-/// Kept `pub(crate)` so the Pi executor can reuse the same parsing logic
-/// when it watches stdout for `get_state` responses.
-pub(crate) fn extract_session_id_from_state(data: &Option<Value>) -> Option<String> {
-    let data = data.as_ref()?;
-
-    data.get("sessionId")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-        .or_else(|| {
-            data.get("session_id")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string())
-        })
-        .or_else(|| {
-            data.pointer("/session/sessionId")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string())
-        })
-        .or_else(|| {
-            data.pointer("/session/session_id")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string())
-        })
-}
-
-fn spawn_session_discovery(
-    msg_store: Arc<MsgStore>,
-    worktree_path: PathBuf,
-    session_id_pushed: Arc<AtomicBool>,
-    session_discovery_in_flight: Arc<AtomicBool>,
-    process_start_time: SystemTime,
-) {
-    if session_id_pushed.load(Ordering::Relaxed) {
-        return;
-    }
-
-    if session_discovery_in_flight.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    tracing::info!(
-        "Pi session_id not in RPC output, attempting filesystem discovery from: {}",
-        worktree_path.display()
-    );
-
-    tokio::spawn(async move {
-        // Try up to 6 times with increasing delays: 0ms, 300ms, 600ms, 1000ms, 1500ms, 2000ms
-        // Pi creates the session directory immediately but writes the file asynchronously
-        // Total max delay: ~5.4 seconds to allow Pi time to write the session file
-        let delays = [0, 300, 600, 1000, 1500, 2000];
-        let mut discovered: Option<String> = None;
-
-        for (attempt, &delay_ms) in delays.iter().enumerate() {
-            if session_id_pushed.load(Ordering::Relaxed) {
-                break;
-            }
-
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-
-            if session_id_pushed.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let attempt_path = worktree_path.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                crate::executors::pi::session::find_latest_session_id_with_constraint(
-                    &attempt_path,
-                    Some(process_start_time),
-                )
-            })
-            .await;
-
-            match result {
-                Ok(Ok(id)) => {
-                    tracing::info!(
-                        "Successfully discovered session_id on attempt {}: {}",
-                        attempt + 1,
-                        id
-                    );
-                    discovered = Some(id);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    if attempt < delays.len() - 1 {
-                        tracing::debug!("Attempt {} failed, will retry: {}", attempt + 1, e);
-                    } else {
-                        tracing::warn!(
-                            "Failed to discover Pi session_id from disk at {} after {} attempts: {}",
-                            worktree_path.display(),
-                            delays.len(),
-                            e
-                        );
-                    }
-                }
-                Err(e) => {
-                    if attempt < delays.len() - 1 {
-                        tracing::debug!(
-                            "Attempt {} failed, will retry after join error: {}",
-                            attempt + 1,
-                            e
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Failed to discover Pi session_id from disk at {} after {} attempts: {}",
-                            worktree_path.display(),
-                            delays.len(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        if let Some(id) = discovered {
-            push_session_id_once(&msg_store, &session_id_pushed, id);
-        } else if !session_id_pushed.load(Ordering::Relaxed) {
-            tracing::warn!(
-                "No session_id available after retries - will try again on next AgentStart"
-            );
-        }
-
-        session_discovery_in_flight.store(false, Ordering::SeqCst);
     });
 }
 
@@ -531,7 +447,10 @@ fn update_tool_state_with_output(state: &mut ToolState, output: Value) {
             } else if let Some(s) = output.as_str() {
                 (s.to_string(), None)
             } else {
-                (serde_json::to_string_pretty(&output).unwrap_or_default(), None)
+                (
+                    serde_json::to_string_pretty(&output).unwrap_or_default(),
+                    None,
+                )
             };
 
             *result = Some(CommandRunResult {
@@ -573,12 +492,9 @@ enum PiEvent {
     AgentStart {
         #[serde(default)]
         session_id: Option<String>,
-        #[serde(default)]
-        model: Option<String>,
     },
     AgentEnd {
-        #[serde(default)]
-        session_id: Option<String>,
+        messages: Vec<Value>,
     },
     MessageStart {
         message: Value,
@@ -587,6 +503,7 @@ enum PiEvent {
         message: Value,
     },
     MessageUpdate {
+        message: Value,
         #[serde(rename = "assistantMessageEvent")]
         assistant_message_event: AssistantMessageEvent,
     },
@@ -689,14 +606,13 @@ enum AssistantMessageEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::time::Duration;
 
     use serde_json::json;
     use uuid::Uuid;
     use workspace_utils::{log_msg::LogMsg, msg_store::MsgStore};
 
+    use super::*;
     use crate::logs::{
         NormalizedEntry, NormalizedEntryType,
         utils::{EntryIndexProvider, patch::extract_normalized_entry_from_patch},
@@ -722,11 +638,7 @@ mod tests {
         let worktree_path =
             std::env::temp_dir().join(format!("pi-session-test-{}", Uuid::new_v4()));
 
-        normalize_logs(
-            msg_store.clone(),
-            &worktree_path,
-            entry_index_provider,
-        );
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
 
         msg_store.push_stdout("{\"type\":\"agent_start\"}\n".to_string());
         msg_store.push_stdout(
@@ -752,6 +664,135 @@ mod tests {
         assert!(entry.content.contains("Hello"));
     }
 
+    fn find_entries_by_type(
+        history: &[LogMsg],
+        match_fn: impl Fn(&NormalizedEntryType) -> bool,
+    ) -> Vec<NormalizedEntry> {
+        history
+            .iter()
+            .filter_map(|msg| {
+                if let LogMsg::JsonPatch(patch) = msg {
+                    extract_normalized_entry_from_patch(patch)
+                        .and_then(|(_, entry)| match_fn(&entry.entry_type).then_some(entry))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_thinking_content_is_normalized() {
+        let msg_store = Arc::new(MsgStore::new());
+        let entry_index_provider = EntryIndexProvider::test_new();
+        let worktree_path =
+            std::env::temp_dir().join(format!("pi-thinking-test-{}", Uuid::new_v4()));
+
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
+
+        msg_store.push_stdout("{\"type\":\"agent_start\"}\n".to_string());
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"thinking_delta\",\"contentIndex\":0,\"delta\":\"Let me \"}}\n".to_string(),
+        );
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"thinking_end\",\"contentIndex\":0,\"content\":\"Let me think about this\"}}\n".to_string(),
+        );
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":1,\"delta\":\"Here is my answer\"}}\n".to_string(),
+        );
+        msg_store.push_stdout("{\"type\":\"turn_end\",\"message\":{}}\n".to_string());
+        msg_store.push_finished();
+
+        let wait_for_entries = async {
+            loop {
+                let history = msg_store.get_history();
+                let thinking = find_entries_by_type(&history, |t| {
+                    matches!(t, NormalizedEntryType::Thinking)
+                });
+                let assistant = find_entries_by_type(&history, |t| {
+                    matches!(t, NormalizedEntryType::AssistantMessage)
+                });
+                if !thinking.is_empty() && !assistant.is_empty() {
+                    return (thinking, assistant);
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let (thinking, assistant) =
+            tokio::time::timeout(Duration::from_millis(250), wait_for_entries)
+                .await
+                .expect("thinking + assistant normalization timed out");
+
+        assert_eq!(thinking.last().unwrap().content, "Let me think about this");
+        assert!(assistant[0].content.contains("Here is my answer"));
+    }
+
+    #[tokio::test]
+    async fn test_rpc_response_error_is_surfaced() {
+        let msg_store = Arc::new(MsgStore::new());
+        let entry_index_provider = EntryIndexProvider::test_new();
+        let worktree_path =
+            std::env::temp_dir().join(format!("pi-rpc-error-test-{}", Uuid::new_v4()));
+
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
+
+        msg_store.push_stdout(
+            "{\"type\":\"response\",\"command\":\"prompt\",\"success\":false,\"error\":\"invalid prompt format\"}\n".to_string(),
+        );
+        msg_store.push_finished();
+
+        let wait_for_error = async {
+            loop {
+                let errors = find_entries_by_type(&msg_store.get_history(), |t| {
+                    matches!(t, NormalizedEntryType::ErrorMessage { .. })
+                });
+                if !errors.is_empty() {
+                    return errors;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let errors = tokio::time::timeout(Duration::from_millis(250), wait_for_error)
+            .await
+            .expect("RPC error normalization timed out");
+
+        assert!(errors[0].content.contains("invalid prompt format"));
+    }
+
+    #[tokio::test]
+    async fn test_message_content_flushed_on_stream_end() {
+        let msg_store = Arc::new(MsgStore::new());
+        let entry_index_provider = EntryIndexProvider::test_new();
+        let worktree_path =
+            std::env::temp_dir().join(format!("pi-flush-test-{}", Uuid::new_v4()));
+
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
+
+        // Send text deltas but no TurnEnd/AgentEnd — simulate a crash
+        msg_store.push_stdout("{\"type\":\"agent_start\"}\n".to_string());
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"partial content\"}}\n".to_string(),
+        );
+        msg_store.push_finished();
+
+        let wait_for_message = async {
+            loop {
+                if let Some(entry) = find_assistant_message(&msg_store.get_history()) {
+                    return entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let entry = tokio::time::timeout(Duration::from_millis(250), wait_for_message)
+            .await
+            .expect("stream-end flush timed out");
+
+        assert_eq!(entry.content, "partial content");
+    }
+
     #[test]
     fn pi_edit_diff_uses_relative_path_snapshot() {
         let params = json!({
@@ -773,7 +814,7 @@ mod tests {
 
         assert_eq!(
             diff,
-            "--- a/src/example.txt\n+++ b/src/example.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+            "--- a/src/example.txt\n+++ b/src/example.txt\n@@ -1 +1 @@\n-old\n+new\n"
         );
     }
 }
