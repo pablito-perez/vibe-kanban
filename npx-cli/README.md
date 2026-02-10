@@ -117,6 +117,47 @@ Vibe Kanban supports customization through its configuration system:
 - Git (for repository operations)
 - Your preferred code editor (optional, for opening task worktrees)
 
+## Publishing (Maintainers)
+
+This repository uses `npx-cli/package.json` as the publishable npm package.
+The root `package.json` is `private` and is used for workspace scripts.
+
+### Publish to npmjs
+
+```bash
+# from repo root
+pnpm i
+pnpm run build:npx
+
+# publish package
+cd npx-cli
+npm whoami || npm login
+npm pack --dry-run
+npm publish --access public
+```
+
+### Publish to GitHub Packages (npm)
+
+Configure your npm auth for the scoped package:
+
+```bash
+cat >> ~/.npmrc <<'EOF'
+@pablito-perez:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=YOUR_GITHUB_PAT
+EOF
+```
+
+Then publish:
+
+```bash
+# from repo root
+pnpm i
+pnpm run build:npx
+
+cd npx-cli
+npm publish --registry=https://npm.pkg.github.com
+```
+
 ## Supported Platforms
 
 - Linux x64

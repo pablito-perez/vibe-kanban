@@ -1,0 +1,74 @@
+name: Publish GitHub Packages (macOS ARM64)
+
+# Workflow disabled - uncomment to re-enable
+# on:
+#   push:
+#     branches:
+#       - main
+#       - beta
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: publish-github-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NODE_VERSION: 22
+  PNPM_VERSION: 10.13.1
+  RUST_TOOLCHAIN: nightly-2025-12-04
+
+jobs:
+  publish:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: ./.github/actions/setup-node
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          cache-on-failure: true
+
+      - name: Verify runner architecture
+        run: |
+          echo "Runner arch: $(uname -m)"
+          if [ "$(uname -m)" != "arm64" ]; then
+            echo "Expected Apple Silicon runner (arm64)."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build macOS ARM64 package
+        run: pnpm run build:npx
+
+      - name: Select publish tag
+        id: publish_tag
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "beta" ]; then
+            echo "tag=beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
+          cd npx-cli
+          npm publish --registry=https://npm.pkg.github.com --tag "${{ steps.publish_tag.outputs.tag }}"
