@@ -39,6 +39,8 @@ pub fn normalize_logs(
         let session_discovery_in_flight = Arc::new(AtomicBool::new(false));
         let mut tool_states: HashMap<String, ToolState> = HashMap::new();
         let mut current_message_content = String::new();
+        let mut current_thinking_content = String::new();
+        let mut thinking_entry_index: Option<usize> = None;
 
         let worktree_path_str = worktree_path.to_string_lossy();
 
@@ -98,21 +100,68 @@ pub fn normalize_logs(
                 }
 
                 PiEvent::MessageUpdate {
+                    message: _,
                     assistant_message_event,
                 } => {
-                    // Accumulate message content from deltas
                     match assistant_message_event {
+                        // --- Thinking events ---
+                        AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                            current_thinking_content.push_str(&delta);
+
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::Thinking,
+                                content: current_thinking_content.clone(),
+                                metadata: None,
+                            };
+
+                            if let Some(idx) = thinking_entry_index {
+                                replace_normalized_entry(&msg_store, idx, entry);
+                            } else {
+                                let idx = add_normalized_entry(
+                                    &msg_store,
+                                    &entry_index_provider,
+                                    entry,
+                                );
+                                thinking_entry_index = Some(idx);
+                            }
+                        }
+                        AssistantMessageEvent::ThinkingEnd { content, .. } => {
+                            if !content.is_empty() {
+                                current_thinking_content = content;
+                            }
+
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::Thinking,
+                                content: current_thinking_content.clone(),
+                                metadata: None,
+                            };
+
+                            if let Some(idx) = thinking_entry_index {
+                                replace_normalized_entry(&msg_store, idx, entry);
+                            } else {
+                                add_normalized_entry(&msg_store, &entry_index_provider, entry);
+                            }
+
+                            // Reset for potential next thinking block
+                            current_thinking_content.clear();
+                            thinking_entry_index = None;
+                        }
+
+                        // --- Text events ---
                         AssistantMessageEvent::TextDelta { delta, .. } => {
                             current_message_content.push_str(&delta);
                         }
                         AssistantMessageEvent::TextEnd { content, .. } => {
-                            // Use the final content if available
                             if !content.is_empty() {
                                 current_message_content = content;
                             }
                         }
+
                         _ => {
-                            // Ignore thinking, toolcall events for now
+                            // ThinkingStart, TextStart, Toolcall* events are
+                            // structural markers and don't carry content we need.
                         }
                     }
                 }
@@ -156,7 +205,11 @@ pub fn normalize_logs(
                         update_tool_state_with_output(&mut state, result);
 
                         if let Some(index) = state.index {
-                            replace_normalized_entry(&msg_store, index, state.to_normalized_entry());
+                            replace_normalized_entry(
+                                &msg_store,
+                                index,
+                                state.to_normalized_entry(),
+                            );
                         }
                     }
                 }
@@ -191,8 +244,10 @@ pub fn normalize_logs(
                     command,
                     success,
                     data,
+                    error,
                     ..
                 } => {
+                    // Try to extract session_id from get_state responses
                     if command == "get_state" && success {
                         if let Some(session_id) = extract_session_id_from_state(&data) {
                             push_session_id_once(
@@ -202,12 +257,58 @@ pub fn normalize_logs(
                             );
                         }
                     }
+
+                    // RPC responses confirm receipt of commands (e.g. the initial prompt).
+                    // Surface failures as error messages so they're visible to the user.
+                    if !success {
+                        let msg = error.unwrap_or_else(|| {
+                            format!("RPC command '{}' failed (no details)", command)
+                        });
+                        let entry = NormalizedEntry {
+                            timestamp: None,
+                            entry_type: NormalizedEntryType::ErrorMessage {
+                                error_type: NormalizedEntryError::Other,
+                            },
+                            content: msg,
+                            metadata: None,
+                        };
+                        add_normalized_entry(&msg_store, &entry_index_provider, entry);
+                    }
                 }
 
                 _ => {
-                    // Other events we don't handle (MessageStart, MessageEnd, TurnStart, etc.)
+                    // Forward-compatible: MessageStart, MessageEnd, TurnStart,
+                    // ToolExecutionUpdate, and any future event types are
+                    // silently ignored.
                 }
             }
+        }
+
+        // Flush any remaining content when the stream ends.
+        // This covers cases where the process exits or crashes before
+        // emitting a TurnEnd/AgentEnd event.
+        if !current_thinking_content.is_empty() {
+            let entry = NormalizedEntry {
+                timestamp: None,
+                entry_type: NormalizedEntryType::Thinking,
+                content: current_thinking_content,
+                metadata: None,
+            };
+            if let Some(idx) = thinking_entry_index {
+                replace_normalized_entry(&msg_store, idx, entry);
+            } else {
+                add_normalized_entry(&msg_store, &entry_index_provider, entry);
+            }
+        }
+
+        if !current_message_content.is_empty() {
+            let entry = NormalizedEntry {
+                timestamp: None,
+                entry_type: NormalizedEntryType::AssistantMessage,
+                content: current_message_content,
+                metadata: None,
+            };
+            add_normalized_entry(&msg_store, &entry_index_provider, entry);
         }
     });
 }
@@ -531,7 +632,10 @@ fn update_tool_state_with_output(state: &mut ToolState, output: Value) {
             } else if let Some(s) = output.as_str() {
                 (s.to_string(), None)
             } else {
-                (serde_json::to_string_pretty(&output).unwrap_or_default(), None)
+                (
+                    serde_json::to_string_pretty(&output).unwrap_or_default(),
+                    None,
+                )
             };
 
             *result = Some(CommandRunResult {
@@ -577,8 +681,7 @@ enum PiEvent {
         model: Option<String>,
     },
     AgentEnd {
-        #[serde(default)]
-        session_id: Option<String>,
+        messages: Vec<Value>,
     },
     MessageStart {
         message: Value,
@@ -587,6 +690,7 @@ enum PiEvent {
         message: Value,
     },
     MessageUpdate {
+        message: Value,
         #[serde(rename = "assistantMessageEvent")]
         assistant_message_event: AssistantMessageEvent,
     },
@@ -689,14 +793,13 @@ enum AssistantMessageEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::time::Duration;
 
     use serde_json::json;
     use uuid::Uuid;
     use workspace_utils::{log_msg::LogMsg, msg_store::MsgStore};
 
+    use super::*;
     use crate::logs::{
         NormalizedEntry, NormalizedEntryType,
         utils::{EntryIndexProvider, patch::extract_normalized_entry_from_patch},
@@ -715,6 +818,23 @@ mod tests {
         })
     }
 
+    fn find_entries_by_type(
+        history: &[LogMsg],
+        match_fn: impl Fn(&NormalizedEntryType) -> bool,
+    ) -> Vec<NormalizedEntry> {
+        history
+            .iter()
+            .filter_map(|msg| {
+                if let LogMsg::JsonPatch(patch) = msg {
+                    extract_normalized_entry_from_patch(patch)
+                        .and_then(|(_, entry)| match_fn(&entry.entry_type).then_some(entry))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_session_discovery_does_not_block_log_loop() {
         let msg_store = Arc::new(MsgStore::new());
@@ -722,15 +842,11 @@ mod tests {
         let worktree_path =
             std::env::temp_dir().join(format!("pi-session-test-{}", Uuid::new_v4()));
 
-        normalize_logs(
-            msg_store.clone(),
-            &worktree_path,
-            entry_index_provider,
-        );
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
 
         msg_store.push_stdout("{\"type\":\"agent_start\"}\n".to_string());
         msg_store.push_stdout(
-            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"Hello\"}}\n"
+            "{\"type\":\"message_update\",\"message\":{},\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"Hello\"}}\n"
                 .to_string(),
         );
         msg_store.push_stdout("{\"type\":\"turn_end\",\"message\":{}}\n".to_string());
@@ -750,6 +866,118 @@ mod tests {
             .expect("assistant message normalization timed out");
 
         assert!(entry.content.contains("Hello"));
+    }
+
+    #[tokio::test]
+    async fn test_thinking_content_is_normalized() {
+        let msg_store = Arc::new(MsgStore::new());
+        let entry_index_provider = EntryIndexProvider::test_new();
+        let worktree_path =
+            std::env::temp_dir().join(format!("pi-thinking-test-{}", Uuid::new_v4()));
+
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
+
+        msg_store.push_stdout("{\"type\":\"agent_start\"}\n".to_string());
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"message\":{},\"assistantMessageEvent\":{\"type\":\"thinking_delta\",\"contentIndex\":0,\"delta\":\"Let me \"}}\n".to_string(),
+        );
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"message\":{},\"assistantMessageEvent\":{\"type\":\"thinking_end\",\"contentIndex\":0,\"content\":\"Let me think about this\"}}\n".to_string(),
+        );
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"message\":{},\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":1,\"delta\":\"Here is my answer\"}}\n".to_string(),
+        );
+        msg_store.push_stdout("{\"type\":\"turn_end\",\"message\":{}}\n".to_string());
+        msg_store.push_finished();
+
+        let wait_for_entries = async {
+            loop {
+                let history = msg_store.get_history();
+                let thinking = find_entries_by_type(&history, |t| {
+                    matches!(t, NormalizedEntryType::Thinking)
+                });
+                let assistant = find_entries_by_type(&history, |t| {
+                    matches!(t, NormalizedEntryType::AssistantMessage)
+                });
+                if !thinking.is_empty() && !assistant.is_empty() {
+                    return (thinking, assistant);
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let (thinking, assistant) =
+            tokio::time::timeout(Duration::from_millis(250), wait_for_entries)
+                .await
+                .expect("thinking + assistant normalization timed out");
+
+        assert_eq!(thinking.last().unwrap().content, "Let me think about this");
+        assert!(assistant[0].content.contains("Here is my answer"));
+    }
+
+    #[tokio::test]
+    async fn test_rpc_response_error_is_surfaced() {
+        let msg_store = Arc::new(MsgStore::new());
+        let entry_index_provider = EntryIndexProvider::test_new();
+        let worktree_path =
+            std::env::temp_dir().join(format!("pi-rpc-error-test-{}", Uuid::new_v4()));
+
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
+
+        msg_store.push_stdout(
+            "{\"type\":\"response\",\"command\":\"prompt\",\"success\":false,\"error\":\"invalid prompt format\"}\n".to_string(),
+        );
+        msg_store.push_finished();
+
+        let wait_for_error = async {
+            loop {
+                let errors = find_entries_by_type(&msg_store.get_history(), |t| {
+                    matches!(t, NormalizedEntryType::ErrorMessage { .. })
+                });
+                if !errors.is_empty() {
+                    return errors;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let errors = tokio::time::timeout(Duration::from_millis(250), wait_for_error)
+            .await
+            .expect("RPC error normalization timed out");
+
+        assert!(errors[0].content.contains("invalid prompt format"));
+    }
+
+    #[tokio::test]
+    async fn test_message_content_flushed_on_stream_end() {
+        let msg_store = Arc::new(MsgStore::new());
+        let entry_index_provider = EntryIndexProvider::test_new();
+        let worktree_path =
+            std::env::temp_dir().join(format!("pi-flush-test-{}", Uuid::new_v4()));
+
+        normalize_logs(msg_store.clone(), &worktree_path, entry_index_provider);
+
+        // Send text deltas but no TurnEnd/AgentEnd — simulate a crash
+        msg_store.push_stdout("{\"type\":\"agent_start\"}\n".to_string());
+        msg_store.push_stdout(
+            "{\"type\":\"message_update\",\"message\":{},\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"partial content\"}}\n".to_string(),
+        );
+        msg_store.push_finished();
+
+        let wait_for_message = async {
+            loop {
+                if let Some(entry) = find_assistant_message(&msg_store.get_history()) {
+                    return entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let entry = tokio::time::timeout(Duration::from_millis(250), wait_for_message)
+            .await
+            .expect("stream-end flush timed out");
+
+        assert_eq!(entry.content, "partial content");
     }
 
     #[test]
@@ -773,7 +1001,7 @@ mod tests {
 
         assert_eq!(
             diff,
-            "--- a/src/example.txt\n+++ b/src/example.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+            "--- a/src/example.txt\n+++ b/src/example.txt\n@@ -1 +1 @@\n-old\n+new\n"
         );
     }
 }
